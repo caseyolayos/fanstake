@@ -1,0 +1,20 @@
+# Rust / Anchor
+target/
+node_modules/
+.anchor/
+
+# Next.js
+app/.next/
+app/node_modules/
+app/out/
+
+# Keys & secrets (NEVER commit)
+**/*-keypair.json
+**/id.json
+.env
+.env.local
+.env*.local
+
+# OS
+.DS_Store
+*.log

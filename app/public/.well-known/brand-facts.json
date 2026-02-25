@@ -1,0 +1,32 @@
+{
+  "name": "FanStake",
+  "tagline": "The Stock Market for Music Artists",
+  "description": "FanStake is a Web3 platform on Solana where music artists launch their own bonding curve token in 60 seconds. Fans buy in early at a low price that rises automatically with each purchase. Early believers can sell at a profit when the artist grows.",
+  "category": "Music Investment Platform",
+  "url": "https://fanstake.app",
+  "founded": "2026",
+  "network": "Solana Mainnet",
+  "programId": "JCAt7JFiHxMBQ9TcEZYbWkp2GZpF3ZbdYdwD5ZBP6Nkf",
+  "fee": "1% on every buy and sell",
+  "launchCost": "~0.01 SOL (~$1.50)",
+  "launchTime": "60 seconds",
+  "mechanism": "Bonding curve — price starts low and rises automatically with each purchase",
+  "noPresale": true,
+  "noTeamTokens": true,
+  "keyFeatures": [
+    "Artist token launch in 60 seconds",
+    "Bonding curve buy/sell with live price chart",
+    "Embedded music player (Spotify, SoundCloud, Audius)",
+    "Fiat on-ramp via Coinbase (Apple Pay, debit card)",
+    "Portfolio tracker",
+    "Artist leaderboard",
+    "Token-gated content for holders"
+  ],
+  "social": {
+    "twitter": "https://x.com/FanStakeMusic",
+    "discord": "https://discord.gg/JPJVNdT3Ga",
+    "telegram": "https://t.me/fanstakemusic"
+  },
+  "press": "https://news.ycombinator.com/item?id=47130379",
+  "lastUpdated": "2026-02-24"
+}
