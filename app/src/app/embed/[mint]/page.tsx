@@ -24,6 +24,7 @@ export default function EmbedPage() {
   const mint = params.mint as string;
   const [curve, setCurve] = useState<CurveInfo | null>(null);
   const [loading, setLoading] = useState(true);
+  const [artistImage, setArtistImage] = useState<string | null>(null);
 
   useEffect(() => {
     fetch(`/api/curve/${mint}`)
@@ -32,6 +33,14 @@ export default function EmbedPage() {
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [mint]);
+
+  useEffect(() => {
+    if (!curve?.uri?.startsWith("https://")) return;
+    fetch(`/api/fetch-metadata?url=${encodeURIComponent(curve.uri)}`)
+      .then(r => r.json())
+      .then(data => setArtistImage(data.image ?? curve.uri))
+      .catch(() => setArtistImage(curve.uri));
+  }, [curve?.uri]);
 
   const artistUrl = `https://fanstake.app/artist/${mint}`;
 
@@ -57,7 +66,7 @@ export default function EmbedPage() {
   const realTokenReserves = Number(curve.realTokenReserves);
   const price = vTokens > 0 ? (vSol / vTokens) * 1e6 : 0; // lamports per 1 token
   const pctSold = Math.min(((totalSupply - realTokenReserves) / totalSupply) * 100, 100);
-  const imageUrl = curve.uri?.startsWith("http") ? curve.uri : null;
+  const imageUrl = artistImage;
   const verified = isVerified(mint);
 
   return (

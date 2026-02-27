@@ -71,6 +71,7 @@ export default function DashboardPage() {
   const [holderTotal, setHolderTotal] = useState(0);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [embedCopied, setEmbedCopied] = useState(false);
+  const [artistImage, setArtistImage] = useState<string | null>(null);
 
   const fetchCurve = useCallback(async () => {
     try {
@@ -87,6 +88,18 @@ export default function DashboardPage() {
   }, [mintStr, program]);
 
   useEffect(() => { fetchCurve(); }, [fetchCurve]);
+
+  // Resolve artist image — URI may be a JSON metadata file or a direct image URL
+  useEffect(() => {
+    if (!curve?.uri?.startsWith("https://")) return;
+    fetch(`/api/fetch-metadata?url=${encodeURIComponent(curve.uri)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.image) setArtistImage(data.image);
+        else if (!data.error) setArtistImage(curve.uri); // direct image URI
+      })
+      .catch(() => setArtistImage(curve.uri)); // fallback to URI directly
+  }, [curve?.uri]);
 
   useEffect(() => {
     fetch(`/api/holders/${mintStr}`)
@@ -175,7 +188,7 @@ export default function DashboardPage() {
   const marketCap = (price / LAMPORTS_PER_SOL) * (totalSupply / 1_000_000);
   const recentVolume = activity.reduce((s, a) => s + a.solAmount, 0);
 
-  const imageUrl = curve.uri?.startsWith("http") ? curve.uri : null;
+  const imageUrl = artistImage;
 
   return (
     <div className="min-h-screen bg-black text-white">

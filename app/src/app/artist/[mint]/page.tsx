@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import ReactDOM from "react-dom";
-import { useParams } from "next/navigation";
+import { useParams, useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import {
   PublicKey,
@@ -27,8 +27,15 @@ import {
   getPlatformConfigPDA,
 } from "../../../hooks/useProgram";
 import { isVerified, getVerifiedInfo } from "../../../lib/verified";
+import { getArtistVestingPDA } from "../../../hooks/useProgram";
 import { BondingCurveChart } from "../../../components/BondingCurveChart";
 import { HolderGate, GatingConfig } from "../../../components/HolderGate";
+import { computeBadges, topBadge, buildShareTweet, type BadgeInfo } from "../../../lib/badges";
+import { WalletModal } from "../../../components/WalletModal";
+import { WalletName } from "@solana/wallet-adapter-base";
+import { BoostModal } from "../../../components/BoostModal";
+import { EditProfileModal } from "../../../components/EditProfileModal";
+import { SpotifyVerifyBanner } from "../../../components/SpotifyVerifyBanner";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,6 +58,17 @@ interface ArtistMetadata {
   instagram: string | null;
   twitter: string | null;
   gating: GatingConfig | null;
+  lastEditedAt: number | null; // unix ms
+  verified?: {
+    spotify?: {
+      id: string;
+      displayName: string;
+      followers: number;
+      imageUrl: string | null;
+      verifiedAt: string;
+      nameMatch?: boolean;
+    };
+  } | null;
 }
 
 interface CurveData {
@@ -272,9 +290,22 @@ function MusicPlayer({
 // ---------------------------------------------------------------------------
 export default function ArtistPage() {
   const params = useParams();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  // Spotify OAuth callback params
+  const spotifyVerifyEncoded = searchParams.get("sv");
+  const spotifyVerifySig     = searchParams.get("ss");
+  const spotifyError         = searchParams.get("spotify_error");
+  const [showSpotifyBanner, setShowSpotifyBanner] = useState(
+    !!(spotifyVerifyEncoded && spotifyVerifySig)
+  );
   const mintStr = params.mint as string;
   const program = useProgram();
-  const { publicKey, signTransaction } = useWallet();
+  const { publicKey, signTransaction, select, connect } = useWallet();
+  const [showWalletModal, setShowWalletModal] = useState(false);
+  const [showBoostModal, setShowBoostModal] = useState(false);
+  const [showEditModal, setShowEditModal] = useState(false);
   const { connection } = useConnection();
 
   const editFileRef = useRef<HTMLInputElement>(null);
@@ -284,7 +315,7 @@ export default function ArtistPage() {
 
   // Trade state
   const [mode, setMode] = useState<"buy" | "sell">("buy");
-  const [solInput, setSolInput] = useState(""); // for buy (in SOL)
+  const [solInput, setSolInput] = useState("0.01"); // for buy (in SOL) — pre-filled for one-tap buy
   const [tokenInput, setTokenInput] = useState(""); // for sell (in tokens)
   const [txLoading, setTxLoading] = useState(false);
   const [txError, setTxError] = useState<string | null>(null);
@@ -300,11 +331,23 @@ export default function ArtistPage() {
 
   // Holder count
   const [holderCount, setHolderCount] = useState<number | null>(null);
-  const [topHolders, setTopHolders] = useState<{ wallet: string; amount: number; pct: number }[]>([]);
+  const [topHolders, setTopHolders] = useState<{ wallet: string; amount: number; pct: number; rank: number; hasSold: boolean; firstBuyTimestamp: number | null; totalSolSpent: number }[]>([]);
 
   // Activity feed
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [activityLoading, setActivityLoading] = useState(true);
+
+  // Artist skin-in-the-game
+  const [artistTokenBalance, setArtistTokenBalance] = useState<number | null>(null);
+  const [artistHasExited, setArtistHasExited] = useState(false);
+  const [artistHoldingsLoaded, setArtistHoldingsLoaded] = useState(false);
+  const [vestingEnd, setVestingEnd] = useState<number | null>(null); // unix seconds
+
+  // User badge state
+  const [userHolderRank, setUserHolderRank] = useState<number | null>(null);
+  const [userHasSold, setUserHasSold] = useState(false);
+  const [userFirstBuyTimestamp, setUserFirstBuyTimestamp] = useState<number | null>(null);
+  const [userTotalSolSpent, setUserTotalSolSpent] = useState(0);
 
   // Artist metadata (fetched from URI JSON)
   const [artistMeta, setArtistMeta] = useState<ArtistMetadata | null>(null);
@@ -375,9 +418,26 @@ export default function ArtistPage() {
     try {
       const res = await fetch(`/api/holders/${mintStr}`);
       const data = await res.json();
-      if (data.holders) setTopHolders(data.holders.slice(0, 5));
+      if (data.holders) {
+        // Exclude artist wallet from the fan leaderboard + re-rank fans only
+        const artistAddr = curve?.artist?.toString();
+        const fanHolders = (data.holders as { wallet: string; amount: number; pct: number; rank: number; hasSold: boolean; firstBuyTimestamp: number | null; totalSolSpent: number }[])
+          .filter(h => h.wallet !== artistAddr)
+          .map((h, i) => ({ ...h, rank: i + 1 })); // re-rank 1..N for fans only
+        setTopHolders(fanHolders.slice(0, 5));
+        // Extract connected wallet's badge stats (using fan-only rank)
+        if (publicKey) {
+          const mine = fanHolders.find(h => h.wallet === publicKey.toString());
+          if (mine) {
+            setUserHolderRank(mine.rank);
+            setUserHasSold(mine.hasSold);
+            setUserFirstBuyTimestamp(mine.firstBuyTimestamp);
+            setUserTotalSolSpent(mine.totalSolSpent);
+          }
+        }
+      }
     } catch { /* ignore */ }
-  }, [mintStr]);
+  }, [mintStr, publicKey, curve]);
 
   const fetchActivity = useCallback(async () => {
     setActivityLoading(true);
@@ -390,11 +450,41 @@ export default function ArtistPage() {
     }
   }, [mintStr]);
 
+  const fetchArtistHoldings = useCallback(async () => {
+    if (!curve) return;
+    try {
+      const mintPubkey = new PublicKey(mintStr);
+      const artistWallet = curve.artist;
+      const ata = await getAssociatedTokenAddress(mintPubkey, artistWallet);
+      const tokenAcc = await connection.getTokenAccountBalance(ata);
+      const balance = tokenAcc.value.uiAmount ?? 0;
+      setArtistTokenBalance(balance);
+      // Only flag as exited if they definitively held tokens before AND now hold almost none
+      // We check: ATA exists, had a non-trivial balance before, and now < 1% of initial share
+      const initialShare = 100_000_000;
+      setArtistHasExited(balance > 0 && balance < initialShare * 0.01);
+    } catch {
+      // ATA doesn't exist = artist never received tokens to wallet (normal for on-curve allocation)
+      setArtistTokenBalance(null);
+      setArtistHasExited(false);
+    } finally {
+      setArtistHoldingsLoaded(true);
+    }
+    // Fetch vesting schedule
+    try {
+      const mintPubkey = new PublicKey(mintStr);
+      const [vestingPDA] = getArtistVestingPDA(mintPubkey);
+      const vestingAcc = await (program.account as any).vestingSchedule.fetch(vestingPDA);
+      setVestingEnd(vestingAcc.vestingEnd.toNumber());
+    } catch { /* no vesting schedule = old token */ }
+  }, [mintStr, connection, curve, program]);
+
   useEffect(() => { fetchCurve(); }, [fetchCurve]);
   useEffect(() => { fetchUserBalances(); }, [fetchUserBalances]);
   useEffect(() => { fetchHolderCount(); }, [fetchHolderCount]);
   useEffect(() => { fetchTopHolders(); }, [fetchTopHolders]);
   useEffect(() => { fetchActivity(); }, [fetchActivity]);
+  useEffect(() => { if (curve) fetchArtistHoldings(); }, [fetchArtistHoldings, curve]);
 
   // Fetch artist metadata JSON from URI
   useEffect(() => {
@@ -417,6 +507,8 @@ export default function ArtistPage() {
           instagram: data.properties?.links?.instagram ?? null,
           twitter: data.properties?.links?.twitter ?? null,
           gating,
+          lastEditedAt: data.properties?.lastEditedAt ?? null,
+          verified: data.verified ?? null,
         });
       })
       .catch(() => {
@@ -430,6 +522,8 @@ export default function ArtistPage() {
           instagram: null,
           twitter: null,
           gating: null,
+          lastEditedAt: null,
+          verified: null,
         });
       });
   }, [curve?.uri]);
@@ -492,12 +586,12 @@ export default function ArtistPage() {
 
       const tx = new Transaction();
       tx.add(updateIx);
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
       tx.recentBlockhash = blockhash;
       tx.feePayer = publicKey;
 
       const signed = await signTransaction(tx);
-      const sig = await connection.sendRawTransaction(signed.serialize());
+      const sig = await connection.sendRawTransaction(signed.serialize(), { skipPreflight: true, maxRetries: 3 });
       await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
 
       setUpdateSuccess(true);
@@ -562,6 +656,7 @@ export default function ArtistPage() {
           userTokenAccount: ata,
           curveVault,
           feeVault,
+          artistVesting: getArtistVestingPDA(mintPubkey)[0],
           tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
         })
@@ -571,13 +666,13 @@ export default function ArtistPage() {
 
       if (!signTransaction) throw new Error("Wallet cannot sign transactions");
       const { blockhash, lastValidBlockHeight } =
-        await connection.getLatestBlockhash("confirmed");
+        await connection.getLatestBlockhash("finalized");
       tx.recentBlockhash = blockhash;
       tx.feePayer = publicKey;
 
       const signed = await signTransaction(tx);
       const sig = await connection.sendRawTransaction(signed.serialize(), {
-        skipPreflight: false,
+        skipPreflight: true,
         maxRetries: 3,
       });
 
@@ -644,6 +739,7 @@ export default function ArtistPage() {
           userTokenAccount: ata,
           curveVault,
           feeVault,
+          artistVesting: getArtistVestingPDA(mintPubkey)[0],
           tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
         })
@@ -653,13 +749,13 @@ export default function ArtistPage() {
 
       if (!signTransaction) throw new Error("Wallet cannot sign transactions");
       const { blockhash, lastValidBlockHeight } =
-        await connection.getLatestBlockhash("confirmed");
+        await connection.getLatestBlockhash("finalized");
       tx.recentBlockhash = blockhash;
       tx.feePayer = publicKey;
 
       const signed = await signTransaction(tx);
       const sig = await connection.sendRawTransaction(signed.serialize(), {
-        skipPreflight: false,
+        skipPreflight: true,
         maxRetries: 3,
       });
 
@@ -749,6 +845,23 @@ export default function ArtistPage() {
           ← Discover
         </Link>
 
+        {/* Live buy ticker */}
+        {activity.filter(a => a.type === "buy").length > 0 && (
+          <div className="mb-6 overflow-hidden border border-green-900/40 bg-green-950/20 rounded-xl py-2 px-4">
+            <div className="flex gap-8 animate-marquee whitespace-nowrap">
+              {[...activity.filter(a => a.type === "buy"), ...activity.filter(a => a.type === "buy")].map((item, i) => (
+                <span key={i} className="text-xs text-green-400 flex items-center gap-2 shrink-0">
+                  <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse inline-block"></span>
+                  <span className="font-mono text-green-600">{item.wallet.slice(0,4)}…{item.wallet.slice(-4)}</span>
+                  <span>bought</span>
+                  <span className="font-semibold">{item.solAmount.toFixed(3)} SOL</span>
+                  <span className="text-green-700">·</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Artist header */}
         <div className="flex items-center gap-6 mb-8">
           <div className="w-20 h-20 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-3xl font-bold flex-shrink-0 overflow-hidden">
@@ -762,10 +875,23 @@ export default function ArtistPage() {
           <div>
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-3xl font-bold">{curve.name}</h1>
-              {verified ? (
-                <span className="inline-flex items-center gap-1 text-xs bg-green-900/50 text-green-400 border border-green-700 px-2 py-0.5 rounded-full font-medium">
-                  ✓ Verified
-                </span>
+              {/* Verified badge — on-chain metadata takes priority over hardcoded list */}
+              {artistMeta?.verified?.spotify || verified ? (
+                artistMeta?.verified?.spotify?.nameMatch === false ? (
+                  <span
+                    className="inline-flex items-center gap-1 text-xs bg-yellow-900/40 text-yellow-400 border border-yellow-600/50 px-2 py-0.5 rounded-full font-medium cursor-help"
+                    title={`Spotify name "${artistMeta.verified.spotify.displayName}" doesn't match artist name "${curve.name}"`}
+                  >
+                    ⚠️ Verified · Name Mismatch
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 text-xs bg-green-900/50 text-green-400 border border-green-700 px-2 py-0.5 rounded-full font-medium">
+                    ✓ Verified
+                    {(artistMeta?.verified?.spotify || verifiedInfo) && (
+                      <span className="text-green-600">· Spotify</span>
+                    )}
+                  </span>
+                )
               ) : (
                 <span className="inline-flex items-center gap-1 text-xs bg-yellow-900/40 text-yellow-400 border border-yellow-700/50 px-2 py-0.5 rounded-full font-medium">
                   ⚠ Unverified
@@ -790,10 +916,26 @@ export default function ArtistPage() {
                 </span>
               )}
             </p>
-            <div className="flex items-center gap-3 mt-2">
+            <div className="flex flex-wrap items-center gap-2 mt-2">
               {holderCount !== null && (
                 <span className="inline-flex items-center gap-1 text-xs text-purple-400 bg-purple-900/30 border border-purple-800 px-2 py-0.5 rounded-full">
                   🎵 {holderCount} {holderCount === 1 ? "fan" : "fans"} holding
+                </span>
+              )}
+              {/* Artist skin-in-the-game */}
+              {artistHasExited && (
+                <span className="inline-flex items-center gap-1 text-xs text-red-400 bg-red-900/30 border border-red-700 px-2 py-0.5 rounded-full font-semibold animate-pulse">
+                  ⚠️ Artist has exited position
+                </span>
+              )}
+              {!artistHasExited && artistTokenBalance !== null && artistTokenBalance > 0 && (
+                <span className="inline-flex items-center gap-1 text-xs text-green-400 bg-green-900/30 border border-green-800 px-2 py-0.5 rounded-full">
+                  🤝 Artist holds {(artistTokenBalance / 1_000_000).toFixed(1)}M tokens
+                </span>
+              )}
+              {vestingEnd !== null && vestingEnd > Date.now() / 1000 && (
+                <span className="inline-flex items-center gap-1 text-xs text-blue-400 bg-blue-900/20 border border-blue-800 px-2 py-0.5 rounded-full">
+                  🔒 Artist tokens locked {Math.ceil((vestingEnd - Date.now() / 1000) / 86400)}d
                 </span>
               )}
               <p className="text-xs text-gray-600 font-mono">
@@ -803,73 +945,122 @@ export default function ArtistPage() {
           </div>
         </div>
 
+        {/* Spotify verification banner — shown after OAuth redirect */}
+        {showSpotifyBanner && spotifyVerifyEncoded && spotifyVerifySig && (
+          <SpotifyVerifyBanner
+            mint={mintStr}
+            encoded={spotifyVerifyEncoded}
+            sig={spotifyVerifySig}
+            currentMetaUrl={curve.uri}
+            artistName={curve.name}
+            program={program}
+            bondingCurvePDA={getBondingCurvePDA(new PublicKey(mintStr))[0]}
+            onVerified={() => {
+              setShowSpotifyBanner(false);
+              router.replace(`/artist/${mintStr}`); // clean URL
+              fetchCurve(); // reload to show badge
+            }}
+            onDismiss={() => {
+              setShowSpotifyBanner(false);
+              router.replace(`/artist/${mintStr}`);
+            }}
+          />
+        )}
+        {spotifyError && !showSpotifyBanner && (
+          <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded-xl text-xs text-red-300">
+            Spotify verification failed: {decodeURIComponent(spotifyError)}
+          </div>
+        )}
+
         {/* Artist tools — visible only to the token's artist */}
         {publicKey && curve.artist.toString() === publicKey.toString() && (
-          <div className="mb-4">
+          <div className="mb-4 flex flex-wrap gap-3">
             <Link
               href={`/dashboard/${mintStr}`}
               className="inline-flex items-center gap-2 text-xs bg-purple-900/30 border border-purple-700 hover:border-purple-500 text-purple-300 hover:text-purple-200 px-4 py-2 rounded-lg transition font-medium"
             >
               📊 Artist Dashboard — holders, volume, embed code
             </Link>
+            <button
+              onClick={() => setShowBoostModal(true)}
+              className="inline-flex items-center gap-2 text-xs bg-orange-900/30 border border-orange-700 hover:border-orange-500 text-orange-300 hover:text-orange-200 px-4 py-2 rounded-lg transition font-medium"
+            >
+              🔥 Boost Token
+            </button>
+            {/* Vesting countdown */}
+            {vestingEnd !== null && (
+              <span className={`inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border font-medium ${
+                vestingEnd > Date.now() / 1000
+                  ? "bg-blue-900/30 border-blue-700 text-blue-300"
+                  : "bg-green-900/30 border-green-700 text-green-300"
+              }`}>
+                {vestingEnd > Date.now() / 1000
+                  ? <>🔒 Tokens vest in {Math.ceil((vestingEnd - Date.now() / 1000) / 86400)}d</>
+                  : <>🔓 Fully vested</>}
+              </span>
+            )}
+
+            {/* Only show Verify button if not already verified on-chain */}
+            {!artistMeta?.verified?.spotify && (
+              <a
+                href={`/api/auth/spotify?mint=${mintStr}`}
+                className="inline-flex items-center gap-2 text-xs bg-green-900/30 border border-green-700 hover:border-green-500 text-green-300 hover:text-green-200 px-4 py-2 rounded-lg transition font-medium"
+              >
+                ✓ Verify with Spotify
+              </a>
+            )}
+            {/* Claim artist share — shown if artist holds less than their 10% allocation (100M tokens) */}
+            {artistHoldingsLoaded && (artistTokenBalance === null || (artistTokenBalance !== null && artistTokenBalance < 99_000_000)) && (
+              <button
+                onClick={async () => {
+                  if (!program || !publicKey) return;
+                  try {
+                    const { getAssociatedTokenAddress: getATA } = await import("@solana/spl-token");
+                    const { ASSOCIATED_TOKEN_PROGRAM_ID: ATP } = await import("@solana/spl-token");
+                    const { SystemProgram: SP } = await import("@solana/web3.js");
+                    const mintPk = new PublicKey(mintStr);
+                    const artistATA = await getATA(mintPk, publicKey);
+                    const [bondingCurvePDA] = getBondingCurvePDA(mintPk);
+                    const [artistVesting] = getArtistVestingPDA(mintPk);
+                    const tx = await (program.methods as any).claimArtistShare()
+                      .accounts({
+                        bondingCurve: bondingCurvePDA,
+                        mint: mintPk,
+                        artist: publicKey,
+                        artistTokenAccount: artistATA,
+                        artistVesting,
+                        tokenProgram: (await import("@solana/spl-token")).TOKEN_PROGRAM_ID,
+                        associatedTokenProgram: ATP,
+                        systemProgram: SP.programId,
+                      })
+                      .rpc();
+                    alert(`✅ Claimed! tx: ${tx}`);
+                    fetchArtistHoldings();
+                  } catch (e) {
+                    alert(`Error: ${e instanceof Error ? e.message : String(e)}`);
+                  }
+                }}
+                className="inline-flex items-center gap-2 text-xs bg-yellow-900/30 border border-yellow-700 hover:border-yellow-500 text-yellow-300 hover:text-yellow-200 px-4 py-2 rounded-lg transition font-medium"
+              >
+                🎁 Claim Your 10% Token Share
+              </button>
+            )}
           </div>
         )}
 
-        {/* Edit image — visible only to the token's artist */}
+        {/* Edit profile — visible only to the token's artist */}
         {publicKey && curve.artist.toString() === publicKey.toString() && (
-          <div className="mb-6">
-            {!editOpen ? (
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => setEditOpen(true)}
-                  className="text-xs text-purple-400 hover:text-purple-300 border border-purple-800 hover:border-purple-500 rounded-lg px-3 py-1.5 transition"
-                >
-                  ✏️ Edit Artist Image
-                </button>
-                {updateSuccess && (
-                  <span className="text-xs text-green-400">✅ Image updated!</span>
-                )}
-              </div>
-            ) : (
-              <div className="bg-gray-900 border border-purple-800 rounded-2xl p-5 max-w-sm">
-                <p className="text-sm font-bold mb-3 text-purple-300">Update Artist Image</p>
-                <input
-                  ref={editFileRef}
-                  type="file"
-                  accept="image/*"
-                  onChange={handleImageSelect}
-                  className="hidden"
-                />
-                <div
-                  onClick={() => editFileRef.current?.click()}
-                  className="w-24 h-24 rounded-full bg-gray-800 border-2 border-dashed border-gray-600 hover:border-purple-500 flex items-center justify-center cursor-pointer overflow-hidden mx-auto mb-4 transition"
-                >
-                  {newImagePreview ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={newImagePreview} alt="preview" className="w-full h-full object-cover" />
-                  ) : (
-                    <span className="text-2xl">📷</span>
-                  )}
-                </div>
-                {updateError && (
-                  <p className="text-xs text-red-400 mb-3">{updateError}</p>
-                )}
-                <div className="flex gap-2">
-                  <button
-                    onClick={handleUpdateImage}
-                    disabled={updateLoading || !newImageFile}
-                    className="flex-1 py-2 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white text-sm font-medium rounded-lg transition"
-                  >
-                    {updateLoading ? "⏳ Saving..." : "Save Image"}
-                  </button>
-                  <button
-                    onClick={() => { setEditOpen(false); setNewImageFile(null); setNewImagePreview(null); setUpdateError(null); }}
-                    className="px-3 py-2 text-gray-400 hover:text-white border border-gray-700 rounded-lg text-sm transition"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
+          <div className="mb-4">
+            <button
+              onClick={() => setShowEditModal(true)}
+              className="text-xs text-purple-400 hover:text-purple-300 border border-purple-800 hover:border-purple-500 rounded-lg px-3 py-1.5 transition"
+            >
+              ✏️ Edit Profile
+            </button>
+            {artistMeta?.lastEditedAt && (
+              <span className="text-xs text-gray-600 ml-3">
+                Last updated {new Date(artistMeta.lastEditedAt).toLocaleDateString()}
+              </span>
             )}
           </div>
         )}
@@ -1017,9 +1208,12 @@ export default function ArtistPage() {
                 <span>{curve.symbol}: {tokenBalance !== null ? tokenBalance.toLocaleString() : "..."}</span>
               </div>
             ) : (
-              <div className="mb-4 p-3 bg-yellow-900/20 border border-yellow-700 rounded-lg text-xs text-yellow-300 text-center">
-                Connect wallet to trade
-              </div>
+              <button
+                onClick={() => setShowWalletModal(true)}
+                className="w-full mb-4 p-3 bg-yellow-900/20 hover:bg-yellow-900/40 border border-yellow-700 hover:border-yellow-500 rounded-lg text-xs text-yellow-300 text-center transition cursor-pointer"
+              >
+                🔌 Connect wallet to trade
+              </button>
             )}
 
             {mode === "buy" ? (
@@ -1064,11 +1258,14 @@ export default function ArtistPage() {
                   </div>
                 )}
                 <button
-                  onClick={handleBuy}
-                  disabled={txLoading || !publicKey || !solInput}
+                  onClick={() => {
+                    if (!publicKey) { setShowWalletModal(true); return; }
+                    handleBuy();
+                  }}
+                  disabled={txLoading || (!!publicKey && !solInput)}
                   className="w-full py-3 rounded-xl font-bold text-sm transition bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed text-white"
                 >
-                  {txLoading ? "⏳ Buying..." : `Buy ${curve.symbol}`}
+                  {txLoading ? "⏳ Buying..." : !publicKey ? "🔌 Connect & Buy" : `Buy ${curve.symbol}`}
                 </button>
               </div>
             ) : (
@@ -1177,22 +1374,59 @@ export default function ArtistPage() {
                   )}
                 </div>
 
-                {/* Early believer badge */}
-                {holderCount !== null && holderCount <= 100 && (
-                  <div className="mx-4 mb-2 flex items-center gap-2 bg-yellow-900/20 border border-yellow-700/40 rounded-xl px-3 py-2">
-                    <span className="text-lg">⭐</span>
-                    <div>
-                      <p className="text-yellow-400 text-xs font-bold">Early Believer</p>
-                      <p className="text-yellow-600 text-xs">You&apos;re one of the first {holderCount} fans</p>
-                    </div>
-                  </div>
-                )}
+                {/* Holder Badges */}
+                {(() => {
+                  const now = Math.floor(Date.now() / 1000);
+                  const badges = computeBadges({
+                    holderRank: userHolderRank,
+                    solSpent: userTotalSolSpent > 0 ? userTotalSolSpent : lastPurchaseSol,
+                    hasSold: userHasSold,
+                    firstBuyTimestamp: userFirstBuyTimestamp,
+                    nowTimestamp: now,
+                  });
+                  // Always show at least "Early Believer" for first 100 fans if no other badge
+                  const showEarlyBeliever = badges.length === 0 && holderCount !== null && holderCount <= 100;
+                  return (
+                    <>
+                      {badges.map((badge) => (
+                        <div key={badge.label} className={`mx-4 mb-2 flex items-center gap-2 ${badge.bg} border ${badge.border} rounded-xl px-3 py-2`}>
+                          <span className="text-xl">{badge.emoji}</span>
+                          <div>
+                            <p className={`${badge.color} text-xs font-bold`}>{badge.label}</p>
+                            <p className="text-gray-500 text-xs">{badge.description}</p>
+                          </div>
+                        </div>
+                      ))}
+                      {showEarlyBeliever && (
+                        <div className="mx-4 mb-2 flex items-center gap-2 bg-yellow-900/20 border border-yellow-700/40 rounded-xl px-3 py-2">
+                          <span className="text-lg">⭐</span>
+                          <div>
+                            <p className="text-yellow-400 text-xs font-bold">Early Believer</p>
+                            <p className="text-yellow-600 text-xs">You&apos;re one of the first {holderCount} fans</p>
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
 
                 {/* Actions */}
                 <div className="px-4 pb-4 pt-1 flex flex-col gap-2">
                   <a
                     href={`https://x.com/intent/tweet?text=${encodeURIComponent(
-                      `just became an early believer in $${curve.symbol} 🎵\n\nbought ${fmtTokens(lastPurchaseTokens)} tokens on @FanStakeMusic\n\nif they blow up, i win with them 🚀\n\n${typeof window !== "undefined" ? window.location.href : ""}`
+                      buildShareTweet({
+                        badge: topBadge(computeBadges({
+                          holderRank: userHolderRank,
+                          solSpent: userTotalSolSpent > 0 ? userTotalSolSpent : lastPurchaseSol,
+                          hasSold: userHasSold,
+                          firstBuyTimestamp: userFirstBuyTimestamp,
+                          nowTimestamp: Math.floor(Date.now() / 1000),
+                        })),
+                        symbol: curve.symbol,
+                        tokensReceived: fmtTokens(lastPurchaseTokens),
+                        holderRank: userHolderRank,
+                        url: typeof window !== "undefined" ? window.location.href : "",
+                      })
                     )}`}
                     target="_blank"
                     rel="noopener noreferrer"
@@ -1223,35 +1457,53 @@ export default function ArtistPage() {
               symbol={curve.symbol}
             />
 
-            {/* Top Fans Leaderboard */}
-            {topHolders.length > 0 && (
+            {/* Top Fans Leaderboard — excludes artist wallet */}
+            {topHolders.filter(h => h.wallet !== curve.artist.toString()).length > 0 && (
               <div className="bg-gray-900 border border-gray-800 rounded-2xl p-4">
                 <h3 className="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
                   👑 Top Fans
                   <span className="text-xs text-gray-600 font-normal">biggest believers</span>
                 </h3>
                 <div className="space-y-2">
-                  {topHolders.map((h, i) => (
-                    <div key={h.wallet} className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span className={`text-sm w-5 text-center ${i === 0 ? "text-yellow-400" : i === 1 ? "text-gray-300" : i === 2 ? "text-amber-600" : "text-gray-600"}`}>
-                          {i === 0 ? "👑" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}`}
-                        </span>
-                        <a
-                          href={`https://explorer.solana.com/address/${h.wallet}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-xs font-mono text-gray-400 hover:text-white transition"
-                        >
-                          {h.wallet}
-                        </a>
+                  {topHolders.filter(h => h.wallet !== curve.artist.toString()).map((h, i) => {
+                    const now = Math.floor(Date.now() / 1000);
+                    const holderBadges = computeBadges({
+                      holderRank: h.rank,
+                      solSpent: h.totalSolSpent,
+                      hasSold: h.hasSold,
+                      firstBuyTimestamp: h.firstBuyTimestamp,
+                      nowTimestamp: now,
+                    });
+                    const best = topBadge(holderBadges);
+                    return (
+                      <div key={h.wallet} className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className={`text-sm w-5 text-center flex-shrink-0 ${i === 0 ? "text-yellow-400" : i === 1 ? "text-gray-300" : i === 2 ? "text-amber-600" : "text-gray-600"}`}>
+                            {i === 0 ? "👑" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}`}
+                          </span>
+                          <div className="min-w-0">
+                            <a
+                              href={`https://explorer.solana.com/address/${h.wallet}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-xs font-mono text-gray-400 hover:text-white transition block truncate max-w-[120px]"
+                            >
+                              {h.wallet.slice(0, 4)}...{h.wallet.slice(-4)}
+                            </a>
+                            {best && (
+                              <span className={`text-xs ${best.color} font-medium`}>
+                                {best.emoji} {best.label}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <div className="text-right flex-shrink-0">
+                          <p className="text-xs text-white font-mono">{h.amount.toLocaleString(undefined, { maximumFractionDigits: 0 })}</p>
+                          <p className="text-xs text-gray-600">{h.pct.toFixed(1)}%</p>
+                        </div>
                       </div>
-                      <div className="text-right">
-                        <p className="text-xs text-white font-mono">{h.amount.toLocaleString(undefined, { maximumFractionDigits: 0 })}</p>
-                        <p className="text-xs text-gray-600">{h.pct.toFixed(1)}%</p>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -1458,6 +1710,49 @@ export default function ArtistPage() {
       </div>,
       document.body
     )}
+      {/* Edit Profile modal */}
+      {showEditModal && curve && artistMeta !== undefined && (
+        <EditProfileModal
+          mint={mintStr}
+          program={program}
+          bondingCurvePDA={getBondingCurvePDA(new PublicKey(mintStr))[0]}
+          current={{
+            name: curve.name,
+            symbol: curve.symbol,
+            image: artistMeta?.image ?? null,
+            description: artistMeta?.description ?? null,
+            spotify: artistMeta?.spotify ?? null,
+            soundcloud: artistMeta?.soundcloud ?? null,
+            audius: artistMeta?.audius ?? null,
+            instagram: artistMeta?.instagram ?? null,
+            twitter: artistMeta?.twitter ?? null,
+            lastEditedAt: artistMeta?.lastEditedAt ?? null,
+          }}
+          onClose={() => setShowEditModal(false)}
+          onSuccess={() => { fetchCurve(); }}
+        />
+      )}
+
+      {/* Boost modal */}
+      {showBoostModal && curve && (
+        <BoostModal
+          mint={mintStr}
+          artistName={curve.name}
+          onClose={() => setShowBoostModal(false)}
+        />
+      )}
+
+      {/* Wallet connect modal — triggered by Buy button or connect banner */}
+      {showWalletModal && (
+        <WalletModal
+          onClose={() => setShowWalletModal(false)}
+          onSelect={(name) => {
+            setShowWalletModal(false);
+            select(name);
+            setTimeout(() => connect().catch(console.error), 80);
+          }}
+        />
+      )}
     </>
   );
 }

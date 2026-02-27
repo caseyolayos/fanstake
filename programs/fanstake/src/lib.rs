@@ -1,7 +1,11 @@
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo};
 
 declare_id!("JCAt7JFiHxMBQ9TcEZYbWkp2GZpF3ZbdYdwD5ZBP6Nkf");
+
+/// Vesting duration: 90 days in seconds
+const VESTING_DURATION: i64 = 90 * 24 * 60 * 60;
 
 /// FanStake — The stock market for music artists.
 /// Artists launch personal tokens on Solana via a bonding curve.
@@ -33,27 +37,114 @@ pub mod fanstake {
         require!(symbol.len() <= 10, FanStakeError::SymbolTooLong);
         require!(artist_share_bps <= 2000, FanStakeError::ArtistShareTooHigh); // max 20%
 
-        let curve = &mut ctx.accounts.bonding_curve;
-        curve.artist = ctx.accounts.artist.key();
-        curve.mint = ctx.accounts.mint.key();
-        curve.name = name;
-        curve.symbol = symbol;
-        curve.uri = uri;
-        curve.virtual_sol_reserves = 30_000_000_000; // 30 SOL virtual reserves (like pump.fun)
-        curve.virtual_token_reserves = 1_073_000_000_000_000; // ~1.073B tokens virtual
-        curve.real_sol_reserves = 0;
-        curve.real_token_reserves = 793_100_000_000_000; // ~793.1M real tokens available
-        curve.total_supply = 1_000_000_000_000_000; // 1B tokens (6 decimals)
-        curve.artist_share_bps = artist_share_bps;
-        curve.is_active = true;
-        curve.created_at = Clock::get()?.unix_timestamp;
-        curve.bump = ctx.bumps.bonding_curve;
+        // Calculate artist share before mutable borrow
+        const TOTAL_SUPPLY: u64 = 1_000_000_000_000_000;
+        let artist_share_tokens = (TOTAL_SUPPLY as u128)
+            .checked_mul(artist_share_bps as u128).unwrap()
+            .checked_div(10_000).unwrap() as u64;
+
+        {
+            let curve = &mut ctx.accounts.bonding_curve;
+            curve.artist = ctx.accounts.artist.key();
+            curve.mint = ctx.accounts.mint.key();
+            curve.name = name;
+            curve.symbol = symbol;
+            curve.uri = uri;
+            curve.virtual_sol_reserves = 30_000_000_000;
+            curve.virtual_token_reserves = 1_073_000_000_000_000;
+            curve.real_sol_reserves = 0;
+            curve.real_token_reserves = 793_100_000_000_000;
+            curve.total_supply = TOTAL_SUPPLY;
+            curve.artist_share_bps = artist_share_bps;
+            curve.is_active = true;
+            curve.created_at = Clock::get()?.unix_timestamp;
+            curve.bump = ctx.bumps.bonding_curve;
+        } // mutable borrow dropped here
+
+        if artist_share_tokens > 0 {
+            let mint_key = ctx.accounts.mint.key();
+            let seeds = &[
+                b"bonding_curve",
+                mint_key.as_ref(),
+                &[ctx.bumps.bonding_curve],
+            ];
+            let signer = &[&seeds[..]];
+            let cpi_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.artist_token_account.to_account_info(),
+                    authority: ctx.accounts.bonding_curve.to_account_info(),
+                },
+                signer,
+            );
+            token::mint_to(cpi_ctx, artist_share_tokens)?;
+            msg!("Minted {} tokens to artist wallet", artist_share_tokens);
+        }
+
+        // Create vesting schedule — artist cannot sell their allocation for 90 days
+        {
+            let vesting = &mut ctx.accounts.artist_vesting;
+            vesting.mint = ctx.accounts.mint.key();
+            vesting.artist = ctx.accounts.artist.key();
+            vesting.vesting_end = Clock::get()?.unix_timestamp + VESTING_DURATION;
+            vesting.bump = ctx.bumps.artist_vesting;
+        }
+        msg!("Vesting schedule created: locked for 90 days");
 
         // Update platform stats
         let config = &mut ctx.accounts.platform_config;
         config.total_artists += 1;
 
-        msg!("Artist token created: {} ({})", curve.name, curve.symbol);
+        msg!("Artist token created: {} ({})", ctx.accounts.bonding_curve.name, ctx.accounts.bonding_curve.symbol);
+        Ok(())
+    }
+
+    /// Retroactive claim for artists whose tokens were created before auto-mint was added.
+    /// Mints the artist's 10% share to their wallet. Can only be called once (checks ATA balance).
+    pub fn claim_artist_share(ctx: Context<ClaimArtistShare>) -> Result<()> {
+        let curve = &ctx.accounts.bonding_curve;
+        require!(curve.is_active, FanStakeError::CurveNotActive);
+
+        // Only the original artist can claim
+        require!(
+            ctx.accounts.artist.key() == curve.artist,
+            FanStakeError::Unauthorized
+        );
+
+        // Calculate share
+        let artist_share_tokens = (curve.total_supply as u128)
+            .checked_mul(curve.artist_share_bps as u128).unwrap()
+            .checked_div(10_000).unwrap() as u64;
+
+        require!(artist_share_tokens > 0, FanStakeError::InvalidAmount);
+
+        // Mint to artist ATA
+        let mint_key = curve.mint;
+        let bump = curve.bump;
+        let seeds = &[b"bonding_curve".as_ref(), mint_key.as_ref(), &[bump]];
+        let signer = &[&seeds[..]];
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.artist_token_account.to_account_info(),
+                authority: ctx.accounts.bonding_curve.to_account_info(),
+            },
+            signer,
+        );
+        token::mint_to(cpi_ctx, artist_share_tokens)?;
+        msg!("Claimed {} tokens for artist", artist_share_tokens);
+
+        // Create vesting schedule from claim date
+        {
+            let vesting = &mut ctx.accounts.artist_vesting;
+            vesting.mint = ctx.accounts.bonding_curve.mint;
+            vesting.artist = ctx.accounts.artist.key();
+            vesting.vesting_end = Clock::get()?.unix_timestamp + VESTING_DURATION;
+            vesting.bump = ctx.bumps.artist_vesting;
+        }
+        msg!("Vesting schedule created: locked for 90 days from claim");
         Ok(())
     }
 
@@ -161,6 +252,14 @@ pub mod fanstake {
 
         require!(ctx.accounts.bonding_curve.is_active, FanStakeError::CurveNotActive);
         require!(token_amount > 0, FanStakeError::InvalidAmount);
+
+        // Vesting check — if seller is the artist, enforce lockup period
+        if ctx.accounts.user.key() == ctx.accounts.bonding_curve.artist {
+            if let Some(vesting) = ctx.accounts.artist_vesting.as_ref() {
+                let now = Clock::get()?.unix_timestamp;
+                require!(now >= vesting.vesting_end, FanStakeError::TokensStillVesting);
+            }
+        }
 
         // Calculate SOL out using constant product formula
         let sol_out_gross = {
@@ -287,7 +386,23 @@ pub struct CreateArtistToken<'info> {
     pub mint: Account<'info, Mint>,
     #[account(mut)]
     pub artist: Signer<'info>,
+    #[account(
+        init_if_needed,
+        payer = artist,
+        associated_token::mint = mint,
+        associated_token::authority = artist,
+    )]
+    pub artist_token_account: Account<'info, TokenAccount>,
+    #[account(
+        init,
+        payer = artist,
+        space = 8 + VestingSchedule::INIT_SPACE,
+        seeds = [b"artist_vesting", mint.key().as_ref()],
+        bump,
+    )]
+    pub artist_vesting: Account<'info, VestingSchedule>,
     pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
 }
@@ -340,6 +455,12 @@ pub struct BuySell<'info> {
         address = platform_config.fee_vault,
     )]
     pub fee_vault: AccountInfo<'info>,
+    /// Optional vesting schedule — only checked when artist is selling
+    #[account(
+        seeds = [b"artist_vesting", mint.key().as_ref()],
+        bump,
+    )]
+    pub artist_vesting: Option<Account<'info, VestingSchedule>>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
@@ -355,6 +476,15 @@ pub struct PlatformConfig {
     pub fee_bps: u16,           // Platform fee in basis points (100 = 1%)
     pub fee_vault: Pubkey,      // Where fees go
     pub total_artists: u64,     // Counter
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct VestingSchedule {
+    pub mint: Pubkey,       // Token mint
+    pub artist: Pubkey,     // Artist wallet
+    pub vesting_end: i64,   // Unix timestamp when tokens unlock
+    pub bump: u8,
 }
 
 #[account]
@@ -383,6 +513,39 @@ pub struct BondingCurve {
 // ERRORS
 // ============================================================
 
+#[derive(Accounts)]
+pub struct ClaimArtistShare<'info> {
+    #[account(
+        mut,
+        seeds = [b"bonding_curve", mint.key().as_ref()],
+        bump = bonding_curve.bump,
+        has_one = mint,
+    )]
+    pub bonding_curve: Account<'info, BondingCurve>,
+    #[account(mut)]
+    pub mint: Account<'info, Mint>,
+    #[account(mut)]
+    pub artist: Signer<'info>,
+    #[account(
+        init_if_needed,
+        payer = artist,
+        associated_token::mint = mint,
+        associated_token::authority = artist,
+    )]
+    pub artist_token_account: Account<'info, TokenAccount>,
+    #[account(
+        init,
+        payer = artist,
+        space = 8 + VestingSchedule::INIT_SPACE,
+        seeds = [b"artist_vesting", mint.key().as_ref()],
+        bump,
+    )]
+    pub artist_vesting: Account<'info, VestingSchedule>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
 #[error_code]
 pub enum FanStakeError {
     #[msg("Name must be 32 characters or less.")]
@@ -403,4 +566,8 @@ pub enum FanStakeError {
     InsufficientTokens,
     #[msg("Insufficient SOL in the curve.")]
     InsufficientSol,
+    #[msg("Unauthorized: only the artist can perform this action.")]
+    Unauthorized,
+    #[msg("Artist tokens are still vesting. Please wait until the lockup period ends.")]
+    TokensStillVesting,
 }

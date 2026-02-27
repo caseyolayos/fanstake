@@ -7,8 +7,8 @@ import { useRouter } from "next/navigation";
 import { useWallet, useConnection } from "../../components/WalletProvider";
 import { WalletButton, WalletButtonCompact } from "../../components/WalletButton";
 import { Keypair, SystemProgram, SYSVAR_RENT_PUBKEY, LAMPORTS_PER_SOL } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { useProgram, getBondingCurvePDA, getPlatformConfigPDA } from "../../hooks/useProgram";
+import { TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from "@solana/spl-token";
+import { useProgram, getBondingCurvePDA, getPlatformConfigPDA, getArtistVestingPDA } from "../../hooks/useProgram";
 
 /** Resize image to max 800×800 at 85% quality before uploading */
 async function compressImage(file: File): Promise<Blob> {
@@ -205,7 +205,14 @@ export default function LaunchPage() {
 
       // Derive PDAs
       const [bondingCurve] = getBondingCurvePDA(mintKeypair.publicKey);
+      const [artistVesting] = getArtistVestingPDA(mintKeypair.publicKey);
       const [platformConfig] = getPlatformConfigPDA();
+
+      // Derive artist ATA for receiving their 10% share
+      const artistTokenAccount = await getAssociatedTokenAddress(
+        mintKeypair.publicKey,
+        publicKey
+      );
 
       // Call createArtistToken — store metadata JSON URL on-chain
       const tx = await program.methods
@@ -220,7 +227,10 @@ export default function LaunchPage() {
           platformConfig,
           mint: mintKeypair.publicKey,
           artist: publicKey,
+          artistTokenAccount,
+          artistVesting,
           tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
           rent: SYSVAR_RENT_PUBKEY,
         })
@@ -466,6 +476,7 @@ export default function LaunchPage() {
                 <option value="dnb">Drum & Bass</option>
                 <option value="trance">Trance</option>
                 <option value="dubstep">Dubstep</option>
+                <option value="bass">Bass Music</option>
                 <option value="ambient">Ambient</option>
                 <option value="synthwave">Synthwave</option>
                 <option value="lofi">Lo-Fi</option>

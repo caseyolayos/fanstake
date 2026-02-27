@@ -9,9 +9,10 @@ export async function POST(req: NextRequest) {
 
     const form = new FormData();
     form.append("reqtype", "fileupload");
+    form.append("userhash", ""); // anonymous
     form.append("fileToUpload", new Blob([json], { type: "application/json" }), "metadata.json");
 
-    const res = await fetch("https://catbox.moe/user.php", { method: "POST", body: form });
+    const res = await fetch("https://catbox.moe/user/api.php", { method: "POST", body: form });
     if (!res.ok) {
       return NextResponse.json({ error: `catbox.moe error: ${res.status}` }, { status: 502 });
     }

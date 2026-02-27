@@ -64,3 +64,10 @@ export function getFeeVaultPDA(): [PublicKey, number] {
     PROGRAM_ID
   );
 }
+
+export function getArtistVestingPDA(mint: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("artist_vesting"), mint.toBuffer()],
+    PROGRAM_ID
+  );
+}

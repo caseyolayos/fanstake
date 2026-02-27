@@ -28,9 +28,9 @@ export function Header({ showNav = true }: HeaderProps) {
             <Image
               src="/logo.png"
               alt="FanStake"
-              width={1012}
-              height={311}
-              className="h-10 md:h-12 w-auto object-contain flex-shrink-0"
+              width={500}
+              height={500}
+              className="h-10 w-10 md:h-12 md:w-12 object-contain flex-shrink-0"
             />
           </Link>
 

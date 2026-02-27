@@ -19,6 +19,7 @@ interface Artist {
   totalSupply: number;
   isActive: boolean;
   uri: string;
+  image: string | null; // resolved from metadata JSON or direct URI
   createdAt: number; // unix timestamp
 }
 
@@ -37,7 +38,7 @@ const RANK_STYLES: Record<number, { border: string; badge: string; label: string
 };
 
 function ArtistCard({ artist, rank }: { artist: Artist; rank: number }) {
-  const imageUrl = artist.uri?.startsWith("http") ? artist.uri : null;
+  const imageUrl = artist.image;
   const rankStyle = RANK_STYLES[rank];
   const isHot = artist.realSolReserves > 0.005; // has real buy activity
 
@@ -129,12 +130,19 @@ function SkeletonCard() {
   );
 }
 
+interface ActiveBoost {
+  mint: string;
+  tier: "basic" | "prime";
+  expiresAt: number;
+}
+
 export default function Home() {
   const program = useProgram();
   const [artists, setArtists] = useState<Artist[]>([]);
   const [loading, setLoading] = useState(true);
   const [sortMode, setSortMode] = useState<SortMode>("top");
   const [searchQuery, setSearchQuery] = useState("");
+  const [boosts, setBoosts] = useState<ActiveBoost[]>([]);
 
   // Global activity feed
   interface GlobalActivity {
@@ -169,12 +177,30 @@ export default function Home() {
             totalSupply: (c.totalSupply as BN).toNumber(),
             isActive: c.isActive as boolean,
             uri: c.uri as string,
+            image: null, // resolved below
             createdAt: (c.createdAt as BN).toNumber(),
           };
         });
-        // Default: sort by liquidity (proxy for trading activity)
         parsed.sort((a, b) => b.realSolReserves - a.realSolReserves);
         setArtists(parsed);
+
+        // Resolve images — direct image URIs resolve instantly; JSON URIs need a fetch
+        parsed.forEach(async (artist) => {
+          if (!artist.uri?.startsWith("https://")) return;
+          // Heuristic: if URI ends in image extension it's a direct image
+          if (/\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i.test(artist.uri)) {
+            setArtists(prev => prev.map(a => a.mint === artist.mint ? { ...a, image: artist.uri } : a));
+            return;
+          }
+          try {
+            const r = await fetch(`/api/fetch-metadata?url=${encodeURIComponent(artist.uri)}`);
+            const data = await r.json();
+            const img = data.image ?? artist.uri;
+            setArtists(prev => prev.map(a => a.mint === artist.mint ? { ...a, image: img } : a));
+          } catch {
+            setArtists(prev => prev.map(a => a.mint === artist.mint ? { ...a, image: artist.uri } : a));
+          }
+        });
       } catch (err) {
         console.error("Failed to fetch artists:", err);
       } finally {
@@ -197,6 +223,13 @@ export default function Home() {
       }
     }
     fetchGlobalActivity();
+  }, []);
+
+  useEffect(() => {
+    fetch("/api/boost/active")
+      .then(r => r.json())
+      .then(d => { if (d.boosts) setBoosts(d.boosts); })
+      .catch(() => {});
   }, []);
 
   // Apply sort — derive sorted list, keep original for rank in "top" mode
@@ -271,6 +304,58 @@ export default function Home() {
           </div>
         </div>
       </section>
+
+      {/* Featured / Boosted Artists */}
+      {boosts.length > 0 && !loading && (
+        <section className="px-6 pb-4">
+          <div className="max-w-6xl mx-auto">
+            <div className="flex items-center gap-2 mb-4">
+              <span className="text-sm font-bold text-orange-400 uppercase tracking-widest">🔥 Featured</span>
+              <span className="text-xs text-gray-600">boosted by artist</span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {boosts
+                .sort((a, b) => (b.tier === "prime" ? 1 : 0) - (a.tier === "prime" ? 1 : 0))
+                .map(boost => {
+                  const artist = artists.find(a => a.mint === boost.mint);
+                  if (!artist) return null;
+                  const isPrime = boost.tier === "prime";
+                  const hoursLeft = Math.max(0, Math.ceil((boost.expiresAt - Date.now()) / 3_600_000));
+                  return (
+                    <a
+                      key={boost.mint}
+                      href={`/artist/${boost.mint}`}
+                      className={`block rounded-xl p-4 border transition-all duration-200 relative ${
+                        isPrime
+                          ? "bg-yellow-950/30 border-yellow-500/60 hover:border-yellow-400 shadow-lg shadow-yellow-500/10"
+                          : "bg-orange-950/20 border-orange-600/50 hover:border-orange-400"
+                      }`}
+                    >
+                      <div className="absolute -top-2 -right-2">
+                        <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${isPrime ? "bg-yellow-500 text-black" : "bg-orange-600 text-white"}`}>
+                          {isPrime ? "💎 Prime" : "🔥 Boost"}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        {artist.image ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={artist.image!} alt={artist.name} className="w-12 h-12 rounded-full object-cover border border-gray-700" />
+                        ) : (
+                          <div className="w-12 h-12 rounded-full bg-purple-900/40 flex items-center justify-center text-xl">🎵</div>
+                        )}
+                        <div className="min-w-0">
+                          <p className="text-white font-bold text-sm truncate">{artist.name}</p>
+                          <p className="text-gray-400 text-xs font-mono">${artist.symbol}</p>
+                        </div>
+                      </div>
+                      <p className="text-gray-600 text-xs mt-2 text-right">{hoursLeft}h remaining</p>
+                    </a>
+                  );
+                })}
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* Leaderboard */}
       <section id="discover" className="px-6 py-12">
@@ -444,13 +529,18 @@ export default function Home() {
 
       {/* Footer */}
       <footer className="border-t border-gray-800 px-6 py-8">
-        <div className="max-w-6xl mx-auto flex items-center justify-between text-sm text-gray-500">
-          <p>© 2026 FanStake. Built on Solana.</p>
-          <div className="flex gap-4">
-            <a href="https://x.com/FanStakeMusic" target="_blank" rel="noopener noreferrer" className="hover:text-white transition">Twitter</a>
-            <a href="https://discord.gg/JPJVNdT3Ga" target="_blank" rel="noopener noreferrer" className="hover:text-white transition">Discord</a>
-            <a href="https://t.me/fanstakemusic" target="_blank" rel="noopener noreferrer" className="hover:text-white transition">Telegram</a>
-            <a href="#" className="hover:text-white transition">Docs</a>
+        <div className="max-w-6xl mx-auto flex flex-col items-center gap-4">
+          <a href="https://www.producthunt.com/products/fanstake?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-fanstake" target="_blank" rel="noopener noreferrer">
+            <img alt="FanStake - Invest in music artists before they blow up | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1084960&theme=dark&t=1772023792250" />
+          </a>
+          <div className="flex items-center justify-between w-full text-sm text-gray-500">
+            <p>© 2026 FanStake. Built on Solana.</p>
+            <div className="flex gap-4">
+              <a href="https://x.com/FanStakeMusic" target="_blank" rel="noopener noreferrer" className="hover:text-white transition">Twitter</a>
+              <a href="https://discord.gg/JPJVNdT3Ga" target="_blank" rel="noopener noreferrer" className="hover:text-white transition">Discord</a>
+              <a href="https://t.me/fanstakemusic" target="_blank" rel="noopener noreferrer" className="hover:text-white transition">Telegram</a>
+              <a href="#" className="hover:text-white transition">Docs</a>
+            </div>
           </div>
         </div>
       </footer>

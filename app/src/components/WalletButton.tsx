@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
+import { WalletName } from "@solana/wallet-adapter-base";
 import { useWallet } from "./WalletProvider";
 
-const QRConnect = dynamic(() => import("./QRConnect").then((m) => m.QRConnect), { ssr: false });
+const WalletModal = dynamic(() => import("./WalletModal").then((m) => m.WalletModal), { ssr: false });
+const QRConnect   = dynamic(() => import("./QRConnect").then((m) => m.QRConnect),     { ssr: false });
 
 interface WalletButtonProps {
   className?: string;
@@ -13,91 +14,40 @@ interface WalletButtonProps {
 }
 
 export function WalletButton({ className, compact = false }: WalletButtonProps) {
-  const {
-    publicKey,
-    connected,
-    connecting,
-    metaMaskBlocking,
-    dismissMetaMaskWarning,
-    connect,
-    disconnect,
-  } = useWallet();
-  const [isMobile, setIsMobile] = useState(false);
-  const [hasPhantom, setHasPhantom] = useState(true);
-  const [showQR, setShowQR] = useState(false);
-  const [mounted, setMounted] = useState(false);
+  const { publicKey, connected, connecting, wallet, select, connect, disconnect } = useWallet();
+  const [showModal, setShowModal] = useState(false);
+  const [showQR,    setShowQR]    = useState(false);
+  const [isMobile,  setIsMobile]  = useState(false);
+  const [mounted,   setMounted]   = useState(false);
+
+  // select() is async-React: the wallet state updates on the next render tick.
+  // We wait 80ms after select() before calling connect() so the adapter is ready.
+  // This avoids the stale-wallet-name bug where clicking the same wallet twice
+  // (e.g. Phantom after a previous Phantom session) never fires the effect.
 
   useEffect(() => {
     setMounted(true);
     setIsMobile(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const win = window as any;
-    setHasPhantom(
-      win?.phantom?.solana?.isPhantom || win?.solana?.isPhantom || false
-    );
   }, []);
+
+  const handleSelect = (name: WalletName) => {
+    setShowModal(false);
+    select(name);
+    // Give wallet-adapter one render tick to update its internal state, then connect.
+    setTimeout(() => connect().catch(console.error), 80);
+  };
 
   const short = publicKey
     ? `${publicKey.toString().slice(0, 4)}...${publicKey.toString().slice(-4)}`
     : null;
 
-  const base =
-    "inline-flex items-center gap-1.5 font-medium rounded-lg transition cursor-pointer select-none whitespace-nowrap";
+  const base      = "inline-flex items-center gap-1.5 font-medium rounded-lg transition cursor-pointer select-none whitespace-nowrap";
   const sizeClass = compact ? "text-xs px-2.5 py-1.5" : "text-sm px-4 py-2";
 
-  // ── MetaMask blocking modal ──────────────────────────────────────────────
-  if (metaMaskBlocking) {
-    const modal = (
-      <>
-        {showQR && <QRConnect onClose={() => setShowQR(false)} />}
-        <div className={`fixed inset-0 z-[9999] flex items-center justify-center bg-black/80 backdrop-blur-sm px-4 py-8 overflow-y-auto ${showQR ? "hidden" : ""}`}>
-          <div className="bg-gray-900 border border-yellow-700 rounded-2xl p-6 max-w-sm w-full shadow-2xl">
-            <div className="flex items-start justify-between mb-4">
-              <div className="flex items-center gap-2">
-                <span className="text-2xl">⚠️</span>
-                <h3 className="font-bold text-white">MetaMask is blocking Phantom</h3>
-              </div>
-              <button
-                onClick={dismissMetaMaskWarning}
-                className="text-gray-500 hover:text-white text-xl leading-none ml-2"
-              >
-                ×
-              </button>
-            </div>
+  if (!mounted) return null;
 
-            <p className="text-sm text-gray-400 mb-5">
-              MetaMask&apos;s security scripts block other wallets in the same browser.
-              Pick a fix:
-            </p>
-
-            <div className="space-y-3">
-              {/* Option 1: Scan QR */}
-              <button
-                onClick={() => setShowQR(true)}
-                className="w-full bg-purple-600 hover:bg-purple-500 text-white font-medium py-3 rounded-xl transition text-sm flex items-center justify-center gap-2"
-              >
-                📱 Scan QR code with your phone
-              </button>
-
-              {/* Option 2: Disable MetaMask */}
-              <div className="bg-gray-800 rounded-xl p-4">
-                <p className="text-xs text-gray-500 uppercase mb-2">Or — Desktop fix</p>
-                <ol className="text-sm text-gray-300 space-y-1 list-decimal list-inside">
-                  <li>Open <strong>chrome://extensions</strong></li>
-                  <li>Toggle <strong>MetaMask OFF</strong></li>
-                  <li>Press <span className="font-mono text-gray-400">Cmd+Shift+R</span></li>
-                  <li>Connect Phantom normally</li>
-                </ol>
-              </div>
-            </div>
-          </div>
-        </div>
-      </>
-    );
-
-    // Render via portal so it escapes any stacking context (e.g. header's backdrop-filter)
-    return mounted ? createPortal(modal, document.body) : null;
-  }
+  // ── Modals ───────────────────────────────────────────────────────────────
+  if (showQR) return <QRConnect onClose={() => setShowQR(false)} />;
 
   // ── Connected ────────────────────────────────────────────────────────────
   if (connected && short) {
@@ -112,29 +62,41 @@ export function WalletButton({ className, compact = false }: WalletButtonProps) 
     );
   }
 
-  // ── Mobile without Phantom injected → deep-link ──────────────────────────
-  if (isMobile && !hasPhantom) {
-    const currentUrl = typeof window !== "undefined"
-      ? encodeURIComponent(window.location.href) : "";
-    const origin = typeof window !== "undefined"
-      ? encodeURIComponent(window.location.origin) : "";
+  // ── Mobile — use WalletConnect or injected wallet ────────────────────────
+  if (isMobile) {
     return (
-      <a
-        href={`https://phantom.app/ul/browse/${currentUrl}?ref=${origin}`}
-        className={`${base} ${sizeClass} bg-purple-600 hover:bg-purple-500 text-white ${className ?? ""}`}
-      >
-        {compact ? "🔮" : "🔮 Open in Phantom"}
-      </a>
+      <>
+        {showModal && (
+          <WalletModal
+            onClose={() => setShowModal(false)}
+            onSelect={handleSelect}
+          />
+        )}
+        <button
+          onClick={() => setShowModal(true)}
+          disabled={connecting}
+          className={`${base} ${sizeClass} bg-purple-600 hover:bg-purple-500 disabled:opacity-60 text-white ${className ?? ""}`}
+        >
+          {connecting
+            ? (compact ? "..." : "Connecting...")
+            : (compact ? "Connect" : "Connect Wallet")}
+        </button>
+      </>
     );
   }
 
-  // ── Default connect button ───────────────────────────────────────────────
+  // ── Desktop connect button ────────────────────────────────────────────────
   return (
     <>
-      {showQR && <QRConnect onClose={() => setShowQR(false)} />}
+      {showModal && (
+        <WalletModal
+          onClose={() => setShowModal(false)}
+          onSelect={handleSelect}
+        />
+      )}
       <div className="flex items-center gap-1.5">
         <button
-          onClick={connect}
+          onClick={() => setShowModal(true)}
           disabled={connecting}
           className={`${base} ${sizeClass} bg-purple-600 hover:bg-purple-500 disabled:opacity-60 text-white ${className ?? ""}`}
         >
@@ -145,7 +107,7 @@ export function WalletButton({ className, compact = false }: WalletButtonProps) 
         {!compact && (
           <button
             onClick={() => setShowQR(true)}
-            title="Scan QR code with phone"
+            title="Scan QR with phone"
             className="p-2 text-gray-500 hover:text-white border border-gray-800 hover:border-gray-600 rounded-lg transition text-sm"
           >
             📱

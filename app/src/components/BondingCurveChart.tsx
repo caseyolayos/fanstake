@@ -18,11 +18,15 @@ interface Props {
   symbol: string;
 }
 
-// Format lamports → readable SOL string
-function fmtPrice(lamports: number): string {
-  const sol = lamports / 1e9;
-  if (sol < 0.000001) return sol.toExponential(2) + " SOL";
-  return sol.toFixed(6) + " SOL";
+// Format a price-per-token value (already in SOL, not lamports) into a readable string.
+// Avoids scientific notation — shows lamports for micro prices instead.
+function fmtPrice(solPerToken: number): string {
+  if (solPerToken >= 0.001)      return solPerToken.toFixed(4) + " SOL";
+  if (solPerToken >= 0.000001)   return solPerToken.toFixed(8) + " SOL";
+  // Below 1 microSOL — show in lamports (1 SOL = 1e9 lamports)
+  const lamports = solPerToken * 1e9;
+  if (lamports >= 1)             return lamports.toFixed(2) + " lamports";
+  return (lamports * 1000).toFixed(2) + " milli-lamports";
 }
 
 // Custom tooltip
